@@ -1,24 +1,19 @@
-"""Daemon mode: monitoring loop + Telegram command handling."""
+"""Daemon mode: monitoring loop + Telegram auto-notifications."""
 
 from __future__ import annotations
 
 import asyncio
-import json
+import re
 import signal
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional
 
 from .clients import TelegramBotClient
-from .constants import TELEGRAM_HELP_TEXT
-from .errors import AssistantError
-from .runtime import AssistantRuntime, execute_local_command
-from .stores import Issue
+from .constants import DEFAULT_DENYLIST_PATTERNS, WORKING_UNAVAILABLE_DOMAINS
+from .runtime import AssistantRuntime
 from .utils import (
     format_local_timestamp,
-    now_iso,
-    parse_int,
     parse_iso_datetime,
-    split_telegram_command,
 )
 
 
@@ -30,6 +25,10 @@ class AssistantDaemon:
         self._stopping = asyncio.Event()
         self._last_entity_states: Dict[str, str] = {}
         self._activity_tracking_ready = False
+        self._battery_levels: Dict[str, str] = {}
+        self._unavailable_open: Dict[str, bool] = {}
+        self._error_open: Dict[str, bool] = {}
+        self._denylist_patterns = [re.compile(p, re.IGNORECASE) for p in DEFAULT_DENYLIST_PATTERNS]
 
     async def close(self) -> None:
         await self.telegram.close()
@@ -37,6 +36,7 @@ class AssistantDaemon:
     async def run_forever(self) -> None:
         states = await self.runtime.refresh_states()
         self._prime_activity_tracking(states)
+        self._prime_battery_tracking(states)
         print(
             f"Daemon запущен. HA={self.runtime.config.base_url}; "
             f"entities={len(self.runtime.index.states)}; poll={self.runtime.config.alert_poll_seconds}s"
@@ -75,122 +75,18 @@ class AssistantDaemon:
     async def _monitor_once(self, now: datetime) -> None:
         states = await self.runtime.refresh_states()
         state_map = self._build_state_map(states)
+
+        health_messages = self._collect_health_notifications(states, state_map)
+        for message in health_messages:
+            await self._send_to_owner(message)
+
         activity_messages = self._collect_activity_notifications(states, state_map, now)
         for message in activity_messages:
             await self._send_to_owner(message)
 
-        current_issues, unavailable_since = self.runtime.detector.detect(
-            states,
-            now,
-            self.runtime.alert_state.unavailable_since,
-        )
-
-        previous_issues = self.runtime.alert_state.open_issues
-        updated_issues: Dict[str, Issue] = {}
-
-        for key, issue in current_issues.items():
-            prev = previous_issues.get(key)
-            if prev:
-                issue.first_seen = prev.first_seen
-                issue.last_notified = prev.last_notified
-            else:
-                issue.first_seen = issue.first_seen or now_iso(now)
-            updated_issues[key] = issue
-
-        for key, issue in updated_issues.items():
-            prev = previous_issues.get(key)
-            event = self._detect_issue_event(prev, issue, now)
-            if event and self._can_notify(issue.severity, now):
-                text = self._format_issue_message(event, issue)
-                sent = await self._send_to_owner(text)
-                if sent:
-                    issue.last_notified = now_iso(now)
-
-        for key, prev in previous_issues.items():
-            if key in updated_issues:
-                continue
-            if self._can_notify(prev.severity, now):
-                resolved_text = self._format_resolved_message(prev)
-                await self._send_to_owner(resolved_text)
-
-        self.runtime.alert_state.open_issues = updated_issues
-        self.runtime.alert_state.unavailable_since = unavailable_since
-
-        await self._maybe_send_digest(now, updated_issues)
-        self.runtime.save_alert_state()
-
-    def _detect_issue_event(self, prev: Optional[Issue], current: Issue, now: datetime) -> Optional[str]:
-        if prev is None:
-            return "open"
-
-        if self._severity_rank(current.severity) > self._severity_rank(prev.severity):
-            return "escalated"
-
-        if not current.last_notified:
-            return "open"
-
-        last_notified_dt = parse_iso_datetime(str(current.last_notified))
-        if not last_notified_dt:
-            return "open"
-
-        dedup_delta = timedelta(minutes=self.runtime.config.alert_dedup_min)
-        if now - last_notified_dt >= dedup_delta:
-            return "repeat"
-
-        return None
-
-    def _can_notify(self, severity: str, now: datetime) -> bool:
-        if severity == "critical":
-            return True
-        return not self.runtime.config.quiet_hours.is_quiet(now)
-
-    async def _maybe_send_digest(self, now: datetime, issues: Dict[str, Issue]) -> None:
-        digest_time = self.runtime.config.alert_digest_time
-        if now.time() < digest_time:
-            return
-
-        today = now.date().isoformat()
-        if self.runtime.alert_state.last_digest_date == today:
-            return
-
-        summary = self._build_digest_text(now, issues)
-        sent = await self._send_to_owner(summary)
-        if sent:
-            self.runtime.alert_state.last_digest_date = today
-
-    def _build_digest_text(self, now: datetime, issues: Dict[str, Issue]) -> str:
-        header = f"Сводка дома\nВремя: {now.strftime('%Y-%m-%d %H:%M')}"
-        if not issues:
-            return f"{header}\n\nСтатус: проблем не обнаружено."
-
-        critical = [issue for issue in issues.values() if issue.severity == "critical"]
-        warning = [issue for issue in issues.values() if issue.severity != "critical"]
-
-        lines = [
-            header,
-            f"Открыто проблем: {len(issues)}",
-            f"Критичные: {len(critical)}",
-            f"Предупреждения: {len(warning)}",
-            "",
-            "Актуальные проблемы:",
-        ]
-
-        ordered = sorted(
-            issues.values(),
-            key=lambda item: (self._severity_rank(item.severity), item.title),
-            reverse=True,
-        )
-
-        for index, issue in enumerate(ordered[:25], start=1):
-            lines.append(
-                f"{index}. [{self._severity_label(issue.severity)}] "
-                f"{issue.title} ({issue.entity_id})"
-            )
-
-        if len(ordered) > 25:
-            lines.append(f"... и ещё {len(ordered) - 25} проблем")
-
-        return "\n".join(lines)
+        battery_messages = self._collect_battery_notifications(states)
+        for message in battery_messages:
+            await self._send_to_owner(message)
 
     async def _send_to_owner(self, text: str) -> bool:
         owner = self.runtime.owner_store.get()
@@ -204,41 +100,6 @@ class AssistantDaemon:
         except Exception as exc:  # noqa: BLE001
             print(f"[telegram] не удалось отправить сообщение владельцу: {exc}")
             return False
-
-    def _format_issue_message(self, event: str, issue: Issue) -> str:
-        event_map = {
-            "open": "Новая проблема",
-            "escalated": "Проблема усилена",
-            "repeat": "Напоминание о проблеме",
-        }
-        title = event_map.get(event, "Проблема в системе")
-        first_seen = format_local_timestamp(issue.first_seen, self.runtime.config.tzinfo)
-        return (
-            f"{title}\n"
-            f"Приоритет: {self._severity_label(issue.severity)}\n"
-            f"Объект: {issue.entity_id}\n"
-            f"Событие: {issue.title}\n"
-            f"Детали: {issue.details}\n"
-            f"Впервые замечено: {first_seen}"
-        )
-
-    def _format_resolved_message(self, issue: Issue) -> str:
-        first_seen = format_local_timestamp(issue.first_seen, self.runtime.config.tzinfo)
-        return (
-            "Проблема устранена\n"
-            f"Приоритет: {self._severity_label(issue.severity)}\n"
-            f"Объект: {issue.entity_id}\n"
-            f"Событие: {issue.title}\n"
-            f"Открыта: {first_seen}"
-        )
-
-    @staticmethod
-    def _severity_rank(severity: str) -> int:
-        return 2 if severity == "critical" else 1
-
-    @staticmethod
-    def _severity_label(severity: str) -> str:
-        return "CRITICAL" if severity == "critical" else "WARNING"
 
     def _prime_activity_tracking(self, states: List[Dict[str, Any]]) -> None:
         self._last_entity_states = self._build_state_map(states)
@@ -265,6 +126,310 @@ class AssistantDaemon:
             return float(text)
         except ValueError:
             return None
+
+    def _prime_battery_tracking(self, states: List[Dict[str, Any]]) -> None:
+        self._battery_levels = {}
+        for state in states:
+            entity_id = state.get("entity_id")
+            if not isinstance(entity_id, str) or "." not in entity_id:
+                continue
+            attrs = state.get("attributes", {}) if isinstance(state.get("attributes"), dict) else {}
+            raw_state = str(state.get("state", "")).strip().lower()
+            friendly = str(attrs.get("friendly_name", entity_id))
+            value = self._extract_battery_value(entity_id, raw_state, attrs, friendly)
+            if value is None:
+                continue
+            self._battery_levels[entity_id] = self._battery_level(value)
+
+    def _collect_battery_notifications(self, states: List[Dict[str, Any]]) -> List[str]:
+        messages: List[str] = []
+        seen_entities: set[str] = set()
+
+        for state in states:
+            entity_id = state.get("entity_id")
+            if not isinstance(entity_id, str) or "." not in entity_id:
+                continue
+
+            attrs = state.get("attributes", {}) if isinstance(state.get("attributes"), dict) else {}
+            raw_state = str(state.get("state", "")).strip().lower()
+            friendly = str(attrs.get("friendly_name", entity_id))
+            value = self._extract_battery_value(entity_id, raw_state, attrs, friendly)
+            if value is None:
+                continue
+
+            seen_entities.add(entity_id)
+            current_level = self._battery_level(value)
+            previous_level = self._battery_levels.get(entity_id, "ok")
+            self._battery_levels[entity_id] = current_level
+
+            should_notify = False
+            if current_level in {"warning", "critical"}:
+                if previous_level == "ok":
+                    should_notify = True
+                elif previous_level == "warning" and current_level == "critical":
+                    should_notify = True
+
+            if not should_notify:
+                continue
+
+            device_name = self._clean_battery_device_name(friendly, entity_id)
+            room_name = self._extract_room_name(state, entity_id, friendly)
+            title = (
+                "🚨 Критически низкий заряд"
+                if current_level == "critical"
+                else "🪫 Низкий заряд батареи"
+            )
+
+            lines = [
+                title,
+                f"📟 Устройство: {device_name}",
+                f"📍 Комната: {room_name}",
+                f"🔋 Заряд: {int(round(value))}%",
+            ]
+            messages.append("\n".join(lines))
+
+        for entity_id in list(self._battery_levels.keys()):
+            if entity_id not in seen_entities:
+                self._battery_levels.pop(entity_id, None)
+
+        return messages
+
+    def _battery_level(self, value: float) -> str:
+        if value < self.runtime.config.battery_critical:
+            return "critical"
+        if value < self.runtime.config.battery_warn:
+            return "warning"
+        return "ok"
+
+    @staticmethod
+    def _extract_battery_value(
+        entity_id: str,
+        raw_state: str,
+        attrs: Dict[str, Any],
+        friendly: str,
+    ) -> Optional[float]:
+        device_class = str(attrs.get("device_class", "")).strip().lower()
+        unit = str(attrs.get("unit_of_measurement", "")).strip().lower()
+        marker = f"{entity_id} {friendly}".lower()
+        battery_like = (
+            device_class == "battery"
+            or "battery" in marker
+            or "batare" in marker
+            or "батар" in marker
+            or "заряд" in marker
+            or "zariad" in marker
+        )
+        if not battery_like:
+            return None
+
+        match = re.search(r"-?\d+(?:[.,]\d+)?", raw_state)
+        if not match:
+            return None
+
+        value = float(match.group(0).replace(",", "."))
+        if unit and unit not in {"%", "percent"} and device_class != "battery":
+            return None
+        if value < 0 or value > 100:
+            return None
+        return value
+
+    def _extract_room_name(self, state: Dict[str, Any], entity_id: str, friendly: str) -> str:
+        attrs = state.get("attributes", {}) if isinstance(state.get("attributes"), dict) else {}
+
+        for key in ("room_name", "room", "area_name", "area", "location"):
+            value = attrs.get(key)
+            if isinstance(value, str):
+                text = value.strip()
+                if text and text.lower() not in {"unknown", "unavailable", "none"}:
+                    return self._translate_room_name(text)
+
+        marker = f"{friendly} {entity_id}".lower()
+        token_map = {
+            "kitchen": "Кухня",
+            "кухн": "Кухня",
+            "living room": "Гостиная",
+            "гостин": "Гостиная",
+            "hallway": "Коридор",
+            "corridor": "Коридор",
+            "корид": "Коридор",
+            "bathroom": "Ванная",
+            "ванн": "Ванная",
+            "toilet": "Туалет",
+            "туалет": "Туалет",
+            "bedroom": "Спальня",
+            "спальн": "Спальня",
+            "children": "Детская",
+            "детск": "Детская",
+            "office": "Кабинет",
+            "кабинет": "Кабинет",
+            "balcony": "Балкон",
+            "балкон": "Балкон",
+        }
+        for token, room_name in token_map.items():
+            if token in marker:
+                return room_name
+
+        return "Не указана"
+
+    @staticmethod
+    def _clean_battery_device_name(friendly: str, entity_id: str) -> str:
+        name = friendly.strip() or entity_id
+        cleaned = re.sub(
+            r"(?i)\b(battery level|battery|уровень батареи|батарея|заряд батареи)\b",
+            "",
+            name,
+        )
+        cleaned = re.sub(r"[\s\-_]{2,}", " ", cleaned).strip(" -_")
+        return cleaned or name
+
+    @staticmethod
+    def _severity_emoji(severity: str) -> str:
+        return "🚨" if severity == "critical" else "⚠️"
+
+    def _collect_health_notifications(
+        self,
+        states: List[Dict[str, Any]],
+        state_map: Dict[str, str],
+    ) -> List[str]:
+        messages: List[str] = []
+        seen: set[str] = set()
+
+        for state in states:
+            entity_id = state.get("entity_id")
+            if not isinstance(entity_id, str) or "." not in entity_id:
+                continue
+            seen.add(entity_id)
+
+            if self._is_unavailable_candidate(entity_id):
+                self._collect_unavailable_transition(messages, state, state_map.get(entity_id, ""))
+
+            self._collect_error_transition(messages, state, state_map.get(entity_id, ""))
+
+        for entity_id in list(self._unavailable_open.keys()):
+            if entity_id not in seen:
+                self._unavailable_open.pop(entity_id, None)
+        for entity_id in list(self._error_open.keys()):
+            if entity_id not in seen:
+                self._error_open.pop(entity_id, None)
+
+        return messages
+
+    def _collect_unavailable_transition(
+        self,
+        messages: List[str],
+        state: Dict[str, Any],
+        raw_state: str,
+    ) -> None:
+        entity_id = str(state.get("entity_id", ""))
+        is_unavailable = raw_state in {"unavailable", "unknown", "none"}
+        is_open = self._unavailable_open.get(entity_id, False)
+
+        attrs = state.get("attributes", {}) if isinstance(state.get("attributes"), dict) else {}
+        friendly = self._friendly_name(state, entity_id)
+        room_name = self._extract_room_name(state, entity_id, friendly)
+
+        if is_unavailable and not is_open:
+            self._unavailable_open[entity_id] = True
+            lines = [
+                "📡 Устройство недоступно",
+                f"📟 Устройство: {friendly}",
+                f"📍 Комната: {room_name}",
+                f"⚠️ Статус: {raw_state}",
+            ]
+            messages.append("\n".join(lines))
+            return
+
+        if not is_unavailable and is_open:
+            self._unavailable_open.pop(entity_id, None)
+            lines = [
+                "✅ Устройство снова на связи",
+                f"📟 Устройство: {friendly}",
+                f"📍 Комната: {room_name}",
+                f"📶 Текущий статус: {raw_state}",
+            ]
+            messages.append("\n".join(lines))
+
+    def _collect_error_transition(
+        self,
+        messages: List[str],
+        state: Dict[str, Any],
+        raw_state: str,
+    ) -> None:
+        entity_id = str(state.get("entity_id", ""))
+        is_error, severity, reason = self._detect_entity_error(state, raw_state)
+        is_open = self._error_open.get(entity_id, False)
+
+        friendly = self._friendly_name(state, entity_id)
+        room_name = self._extract_room_name(state, entity_id, friendly)
+
+        if is_error and not is_open:
+            self._error_open[entity_id] = True
+            lines = [
+                f"{self._severity_emoji(severity)} Ошибка устройства",
+                f"📟 Устройство: {friendly}",
+                f"📍 Комната: {room_name}",
+                f"🔎 Ошибка: {reason}",
+            ]
+            messages.append("\n".join(lines))
+            return
+
+        if not is_error and is_open:
+            self._error_open.pop(entity_id, None)
+            lines = [
+                "✅ Ошибка устройства устранена",
+                f"📟 Устройство: {friendly}",
+                f"📍 Комната: {room_name}",
+                f"📶 Текущий статус: {raw_state}",
+            ]
+            messages.append("\n".join(lines))
+
+    def _detect_entity_error(
+        self,
+        state: Dict[str, Any],
+        raw_state: str,
+    ) -> tuple[bool, str, str]:
+        entity_id = str(state.get("entity_id", ""))
+        attrs = state.get("attributes", {}) if isinstance(state.get("attributes"), dict) else {}
+        domain = entity_id.split(".", 1)[0] if "." in entity_id else ""
+
+        if raw_state in {"error", "failed", "fault", "problem"}:
+            reason = self._extract_error_text(state) or f"state={raw_state}"
+            severity = "critical" if raw_state in {"failed", "fault"} else "warning"
+            return True, severity, reason
+
+        if domain == "binary_sensor" and raw_state == "on":
+            device_class = str(attrs.get("device_class", "")).strip().lower()
+            if device_class in {"problem", "safety", "smoke", "gas", "moisture"}:
+                reason = self._extract_error_text(state) or f"device_class={device_class}"
+                severity = "critical" if device_class in {"safety", "smoke", "gas", "moisture"} else "warning"
+                return True, severity, reason
+
+        return False, "warning", ""
+
+    def _extract_error_text(self, state: Dict[str, Any]) -> Optional[str]:
+        attrs = state.get("attributes", {}) if isinstance(state.get("attributes"), dict) else {}
+
+        hms_text = self._extract_hms_error_text(state)
+        if hms_text:
+            return hms_text
+
+        for key in ("error", "error_message", "last_error", "message", "description", "problem"):
+            value = attrs.get(key)
+            if isinstance(value, str):
+                text = value.strip()
+                if text and text.lower() not in {"unknown", "unavailable", "none"}:
+                    return text
+
+        return None
+
+    def _is_unavailable_candidate(self, entity_id: str) -> bool:
+        domain = entity_id.split(".", 1)[0]
+        if domain not in WORKING_UNAVAILABLE_DOMAINS:
+            return False
+        return not self._is_denylisted(entity_id)
+
+    def _is_denylisted(self, entity_id: str) -> bool:
+        return any(pattern.search(entity_id) for pattern in self._denylist_patterns)
 
     @staticmethod
     def _format_hours(hours: float) -> str:
@@ -544,7 +709,6 @@ class AssistantDaemon:
             if cleaning_minutes is not None:
                 lines.append(f"⏱️ Время уборки: {int(round(cleaning_minutes))} мин")
 
-            lines.append(f"ℹ️ Источник: {vacuum_entity}")
             return ["\n".join(lines)]
 
         return []
@@ -600,7 +764,6 @@ class AssistantDaemon:
             if end_time != "-":
                 lines.append(f"🕒 Ориентировочно до: {end_time}")
 
-            lines.append(f"ℹ️ Источник: {print_status_entity}")
             return ["\n".join(lines)]
 
         if was_active and not is_active:
@@ -641,7 +804,6 @@ class AssistantDaemon:
                 if error_text:
                     lines.append(f"🔎 Ошибка: {error_text}")
 
-            lines.append(f"ℹ️ Источник: {print_status_entity}")
             return ["\n".join(lines)]
 
         return []
@@ -699,283 +861,13 @@ class AssistantDaemon:
                 "Доступ запрещён\nБот уже привязан к другому user_id.",
             )
             return
-
-        try:
-            response = await self._handle_owner_command(text.strip())
-        except AssistantError as exc:
-            response = f"Ошибка команды\n{exc}\n\nПодсказка: /help"
-        except Exception as exc:  # noqa: BLE001
-            response = f"Непредвиденная ошибка\n{exc}\n\nПодсказка: /help"
-
-        if response:
-            await self.telegram.send_message(int(owner.get("chat_id")), response)
-
-    async def _handle_owner_command(self, text: str) -> str:
-        cmd, args = split_telegram_command(text)
-        if not cmd:
-            return ""
-
-        if cmd in {"/start", "/help"}:
-            return TELEGRAM_HELP_TEXT
-
-        if cmd == "/status":
-            states = await self.runtime.refresh_states()
-            now = self.runtime.now()
-            issues, _ = self.runtime.detector.detect(
-                states,
-                now,
-                self.runtime.alert_state.unavailable_since,
+        normalized = text.strip().lower()
+        if normalized in {"/start", "/help"}:
+            await self.telegram.send_message(
+                int(owner.get("chat_id")),
+                (
+                    "Режим: только авто-уведомления\n"
+                    "Команды управления и сценарии временно отключены.\n"
+                    "Вы будете получать события уборки и 3D печати."
+                ),
             )
-            return self._build_status_text(now, states, issues)
-
-        if cmd == "/problems":
-            states = await self.runtime.refresh_states()
-            now = self.runtime.now()
-            issues, _ = self.runtime.detector.detect(
-                states,
-                now,
-                self.runtime.alert_state.unavailable_since,
-            )
-            return self._build_problems_text(issues)
-
-        if cmd == "/devices":
-            domain = args[0] if args else None
-            await self.runtime.refresh_states()
-            _, index = await self.runtime.get_snapshot()
-            entities = index.list_entities(domain)
-            if not entities:
-                return "Список устройств\nНичего не найдено."
-            preview = "\n".join(entities[:120])
-            suffix = "" if len(entities) <= 120 else f"\n... и ещё {len(entities) - 120}"
-            scope = domain or "all"
-            return f"Список устройств ({scope})\nНайдено: {len(entities)}\n\n{preview}{suffix}"
-
-        if cmd in {"/on", "/off", "/state"}:
-            if not args:
-                raise AssistantError(f"Использование: {cmd} <entity|alias>")
-            target = " ".join(args)
-            await self.runtime.refresh_states()
-            _, index = await self.runtime.get_snapshot()
-            entity_id, error = index.resolve(target)
-            if error:
-                raise AssistantError(error)
-            assert entity_id is not None
-
-            if cmd == "/state":
-                state = await self.runtime.client.get_state(entity_id)
-                return self._format_state_text(state)
-
-            domain = entity_id.split(".", 1)[0]
-            service = "turn_on" if cmd == "/on" else "turn_off"
-            await self.runtime.client.call_service(domain, service, {"entity_id": entity_id})
-            action = "включение" if service == "turn_on" else "выключение"
-            return (
-                "Команда выполнена\n"
-                f"Действие: {action}\n"
-                f"Устройство: {entity_id}"
-            )
-
-        if cmd == "/sc_list":
-            scenarios = self.runtime.scenarios.list_scenarios()
-            if not scenarios:
-                return "Сценарии ассистента\nПока нет ни одного сценария."
-            lines = ["Сценарии ассистента", f"Всего: {len(scenarios)}", ""]
-            for item in scenarios:
-                steps = item.get("steps", [])
-                lines.append(
-                    f"- {item.get('id')} | {item.get('name')} | "
-                    f"шагов: {len(steps) if isinstance(steps, list) else 0}"
-                )
-            return "\n".join(lines)
-
-        if cmd == "/sc_show":
-            if len(args) != 1:
-                raise AssistantError("Использование: /sc_show <id>")
-            scenario = self.runtime.scenarios.get_scenario(args[0])
-            if not scenario:
-                raise AssistantError(f"Сценарий '{args[0]}' не найден.")
-            lines = [
-                "Карточка сценария",
-                f"ID: {scenario.get('id')}",
-                f"Название: {scenario.get('name')}",
-                f"Обновлён: {format_local_timestamp(scenario.get('updated_at'), self.runtime.config.tzinfo)}",
-                "Шаги:",
-            ]
-            steps = scenario.get("steps", [])
-            if not isinstance(steps, list) or not steps:
-                lines.append("- (пусто)")
-            else:
-                for idx, step in enumerate(steps, start=1):
-                    lines.append(f"{idx}. {self._format_step(step)}")
-            return "\n".join(lines)
-
-        if cmd == "/sc_new":
-            if len(args) < 2:
-                raise AssistantError("Использование: /sc_new <id> <name>")
-            scenario_id = args[0]
-            name = " ".join(args[1:])
-            scenario = self.runtime.scenarios.create_scenario(scenario_id, name, self.runtime.now())
-            return (
-                "Сценарий создан\n"
-                f"ID: {scenario['id']}\n"
-                f"Название: {scenario['name']}"
-            )
-
-        if cmd == "/sc_delete":
-            if len(args) != 1:
-                raise AssistantError("Использование: /sc_delete <id>")
-            self.runtime.scenarios.delete_scenario(args[0])
-            return f"Сценарий удалён\nID: {args[0]}"
-
-        if cmd == "/sc_add":
-            if len(args) < 3:
-                raise AssistantError("Использование: /sc_add <id> on|off|temp|delay|script <...>")
-
-            scenario_id = args[0]
-            step_kind = args[1].lower()
-            step = await self._build_scenario_step(step_kind, args[2:])
-            self.runtime.scenarios.add_step(scenario_id, step, self.runtime.now())
-            return (
-                "Шаг добавлен\n"
-                f"Сценарий: {scenario_id}\n"
-                f"Шаг: {self._format_step(step)}"
-            )
-
-        if cmd == "/sc_step_remove":
-            if len(args) != 2:
-                raise AssistantError("Использование: /sc_step_remove <id> <index>")
-            scenario_id = args[0]
-            index_1based = parse_int(args[1], -1)
-            if index_1based <= 0:
-                raise AssistantError("Индекс шага должен быть положительным числом.")
-            self.runtime.scenarios.remove_step(scenario_id, index_1based, self.runtime.now())
-            return f"Шаг удалён\nСценарий: {scenario_id}\nИндекс: {index_1based}"
-
-        if cmd == "/sc_run":
-            if len(args) != 1:
-                raise AssistantError("Использование: /sc_run <id>")
-            scenario = self.runtime.scenarios.get_scenario(args[0])
-            if not scenario:
-                raise AssistantError(f"Сценарий '{args[0]}' не найден.")
-            return await self.runtime.run_assistant_scenario(scenario)
-
-        if cmd.startswith("/"):
-            return "Неизвестная команда\nИспользуй /help"
-
-        return await execute_local_command(text, self.runtime)
-
-    async def _build_scenario_step(self, step_kind: str, args: List[str]) -> Dict[str, Any]:
-        await self.runtime.refresh_states()
-        _, index = await self.runtime.get_snapshot()
-
-        if step_kind in {"on", "off"}:
-            if len(args) != 1:
-                raise AssistantError("Использование: /sc_add <id> on|off <entity_id>")
-            entity_id = args[0].strip()
-            if entity_id not in index.states:
-                raise AssistantError(f"Сущность '{entity_id}' не найдена в HA.")
-            return {"type": step_kind, "entity_id": entity_id}
-
-        if step_kind == "temp":
-            if len(args) != 2:
-                raise AssistantError("Использование: /sc_add <id> temp <climate_id> <value>")
-            entity_id = args[0].strip()
-            if not entity_id.startswith("climate."):
-                raise AssistantError("Для temp нужен climate entity_id.")
-            if entity_id not in index.states:
-                raise AssistantError(f"Сущность '{entity_id}' не найдена в HA.")
-            try:
-                value = float(args[1].replace(",", "."))
-            except ValueError as exc:
-                raise AssistantError(f"Неверное значение температуры: {args[1]}") from exc
-            return {"type": "temp", "entity_id": entity_id, "value": value}
-
-        if step_kind == "delay":
-            if len(args) != 1:
-                raise AssistantError("Использование: /sc_add <id> delay <seconds>")
-            seconds = parse_int(args[0], -1)
-            if seconds <= 0:
-                raise AssistantError("seconds должен быть положительным числом.")
-            return {"type": "delay", "seconds": seconds}
-
-        if step_kind == "script":
-            if len(args) != 1:
-                raise AssistantError("Использование: /sc_add <id> script <script_id>")
-            script_id = args[0].strip()
-            if not script_id.startswith("script."):
-                raise AssistantError("Нужно указать script.<name>.")
-            if script_id not in index.states:
-                raise AssistantError(f"Сущность '{script_id}' не найдена в HA.")
-            return {"type": "script", "entity_id": script_id}
-
-        raise AssistantError("Допустимые типы шага: on, off, temp, delay, script.")
-
-    def _build_status_text(
-        self,
-        now: datetime,
-        states: List[Dict[str, Any]],
-        issues: Dict[str, Issue],
-    ) -> str:
-        critical = sum(1 for issue in issues.values() if issue.severity == "critical")
-        warning = len(issues) - critical
-        return (
-            "Статус дома\n"
-            f"Время: {now.strftime('%Y-%m-%d %H:%M')}\n"
-            f"Сущностей в Home Assistant: {len(states)}\n"
-            f"Проблем открыто: {len(issues)}\n"
-            f"critical: {critical}\n"
-            f"warning: {warning}"
-        )
-
-    def _build_problems_text(self, issues: Dict[str, Issue]) -> str:
-        if not issues:
-            return "Список проблем\nПроблем не обнаружено."
-
-        lines = ["Список проблем", f"Открытых проблем: {len(issues)}", ""]
-        ordered = sorted(
-            issues.values(),
-            key=lambda item: (self._severity_rank(item.severity), item.title),
-            reverse=True,
-        )
-        for index, issue in enumerate(ordered[:50], start=1):
-            lines.append(
-                f"{index}. [{self._severity_label(issue.severity)}] "
-                f"{issue.title} ({issue.entity_id})"
-            )
-        if len(ordered) > 50:
-            lines.append(f"... и ещё {len(ordered) - 50} проблем")
-        return "\n".join(lines)
-
-    def _format_state_text(self, state: Dict[str, Any]) -> str:
-        entity_id = str(state.get("entity_id", "<unknown>"))
-        value = str(state.get("state", "<unknown>"))
-        attrs = state.get("attributes", {}) if isinstance(state.get("attributes"), dict) else {}
-        friendly = str(attrs.get("friendly_name", entity_id))
-        unit = str(attrs.get("unit_of_measurement", "")).strip()
-        last_changed_raw = state.get("last_changed")
-        last_changed = format_local_timestamp(
-            last_changed_raw if isinstance(last_changed_raw, str) else None,
-            self.runtime.config.tzinfo,
-        )
-        display = f"{value} {unit}".strip()
-
-        return (
-            "Состояние устройства\n"
-            f"Название: {friendly}\n"
-            f"Entity: {entity_id}\n"
-            f"Текущее значение: {display}\n"
-            f"Последнее изменение: {last_changed}"
-        )
-
-    def _format_step(self, step: Dict[str, Any]) -> str:
-        step_type = str(step.get("type", "")).lower()
-        if step_type in {"on", "off"}:
-            action = "включить" if step_type == "on" else "выключить"
-            return f"{action} {step.get('entity_id')}"
-        if step_type == "temp":
-            return f"температура {step.get('entity_id')} = {step.get('value')}"
-        if step_type == "delay":
-            return f"задержка {step.get('seconds')} сек"
-        if step_type == "script":
-            return f"запуск {step.get('entity_id')}"
-        return json.dumps(step, ensure_ascii=False)

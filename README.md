@@ -3,7 +3,7 @@
 Локальный ассистент для Home Assistant с двумя режимами:
 
 - CLI (русские команды для управления домом)
-- Daemon (мониторинг проблем + Telegram-бот + сценарии)
+- Daemon (авто-уведомления в Telegram)
 
 ## 1. Установка
 
@@ -71,9 +71,11 @@ python3 assistant.py daemon
 Что делает daemon:
 
 - опрашивает Home Assistant каждые `ALERT_POLL_SECONDS`
-- выявляет проблемы и отправляет алерты в Telegram
-- отправляет ежедневную сводку в `ALERT_DIGEST_TIME`
-- поддерживает quiet-hours для некритичных алертов
+- отправляет уведомления, если устройство перестало отвечать, и уведомления о восстановлении связи
+- отправляет уведомления, если у устройства появилась ошибка, и уведомления о снятии ошибки
+- отправляет авто-уведомления о событиях уборки
+- отправляет авто-уведомления о старте/завершении/ошибках 3D печати
+- отправляет уведомления о низком/критическом заряде батареи устройств
 
 ## 5. Telegram доступ (owner lock)
 
@@ -89,44 +91,26 @@ python3 assistant.py owner reset
 
 ## 6. Telegram команды
 
+Команды управления временно отключены.
+
+Доступны только:
+
 - `/start`
 - `/help`
-- `/status`
-- `/problems`
-- `/devices [domain]`
-- `/on <entity|alias>`
-- `/off <entity|alias>`
-- `/state <entity|alias>`
-- `/sc_list`
-- `/sc_show <id>`
-- `/sc_new <id> <name>`
-- `/sc_delete <id>`
-- `/sc_add <id> on|off <entity_id>`
-- `/sc_add <id> temp <climate_id> <value>`
-- `/sc_add <id> delay <seconds>`
-- `/sc_add <id> script <script_id>`
-- `/sc_step_remove <id> <index>`
-- `/sc_run <id>`
+
+Обе команды возвращают короткую подсказку, что бот работает в режиме авто-уведомлений.
 
 ## 7. Сценарии ассистента
 
-Сценарии хранятся отдельно в `scenarios.json` (не перезаписывают `automation.*` и `script.*` Home Assistant).
-
-Формат шага:
-
-- `{"type":"on","entity_id":"light.xxx"}`
-- `{"type":"off","entity_id":"switch.xxx"}`
-- `{"type":"temp","entity_id":"climate.xxx","value":22}`
-- `{"type":"delay","seconds":30}`
-- `{"type":"script","entity_id":"script.xxx"}`
+Сценарии и ручное управление через Telegram временно отключены.
 
 ## 8. Файлы состояния
 
 Daemon создаёт/обновляет:
 
 - `bot_owner.json`
-- `scenarios.json`
-- `alert_state.json`
+
+Файлы `scenarios.json` и `alert_state.json` могут оставаться в проекте как legacy-данные, но в режиме авто-уведомлений не используются.
 
 ## 9. Структура кода
 
