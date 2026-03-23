@@ -1,0 +1,16 @@
+services:
+  ha-assistant:
+    build: .
+    container_name: ha-assistant
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      TZ: ${TIMEZONE:-Europe/Minsk}
+      HA_ALIASES_FILE: /app/data/aliases.json
+      TELEGRAM_OWNER_FILE: /app/data/bot_owner.json
+      SCENARIOS_FILE: /app/data/scenarios.json
+      ALERT_STATE_FILE: /app/data/alert_state.json
+    volumes:
+      - ./data:/app/data
+    command: ["python", "assistant.py", "daemon"]

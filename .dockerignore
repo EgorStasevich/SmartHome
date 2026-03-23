@@ -1,0 +1,9 @@
+.git
+.gitignore
+.venv
+__pycache__
+.env
+data
+daemon.log
+daemon.pid
+*.pyc

@@ -1,0 +1,10 @@
+.env
+.venv/
+__pycache__/
+aliases.json
+bot_owner.json
+scenarios.json
+alert_state.json
+data/
+daemon.log
+daemon.pid
